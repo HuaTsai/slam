@@ -1,6 +1,7 @@
 #include <ceres/ceres.h>
 
 #include <Eigen/Dense>
+#include <mutex>
 #include <sophus/se3.hpp>
 
 constexpr float eps = 1e-4;
@@ -42,11 +43,31 @@ class Imu {
   };
 
   struct Bias {
+    Bias() : a(Eigen::Vector3f::Zero()), g(Eigen::Vector3f::Zero()) {}
     explicit Bias(const Eigen::Vector3f &a, const Eigen::Vector3f &g)
         : a(a), g(g) {}
     Eigen::Vector3f a;
     Eigen::Vector3f g;
+    Bias &operator-=(const Bias &b) {
+      a -= b.a;
+      g -= b.g;
+      return *this;
+    }
+    Bias operator-(const Bias &b) const { return Bias(a - b.a, g - b.g); }
   };
+
+  explicit Imu(Bias b) : b_(b), bu_(b) {
+    dR_.setIdentity();
+    dV_.setZero();
+    dP_.setZero();
+    JRg_.setZero();
+    JVg_.setZero();
+    JVa_.setZero();
+    JPg_.setZero();
+    JPa_.setZero();
+    C_.setZero();
+    measurements_.clear();
+  }
 
   void IntegrateNewMeasurement(const Eigen::Vector3f &acc_measured,
                                const Eigen::Vector3f &gyro_measured, float dt) {
@@ -90,13 +111,91 @@ class Imu {
     // XXX: Record total time
   }
 
+  /** Following four functions compute from providing new bias */
+  Bias GetDeltaBias(const Bias &b) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return b - b_;
+  }
+
+  Eigen::Matrix3f GetDeltaRotation(const Bias &b) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return NormalizeRotation(dR_ *
+                             Sophus::SO3f::exp(JRg_ * (b.g - b_.g)).matrix());
+  }
+
+  Eigen::Vector3f GetDeltaVelocity(const Bias &b) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return dV_ + JVg_ * (b.g - b_.g) + JVa_ * (b.a - b_.a);
+  }
+
+  Eigen::Vector3f GetDeltaPosition(const Bias &b) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return dP_ + JPg_ * (b.g - b_.g) + JPa_ * (b.a - b_.a);
+  }
+
+  /** Getters of original data */
+  Bias GetOriginalBias() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return b_;
+  }
+
+  Eigen::Matrix3f GetOriginalDeltaRotation() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return dR_;
+  }
+
+  Eigen::Vector3f GetOriginalDeltaVelocity() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return dV_;
+  }
+
+  Eigen::Vector3f GetOriginalDeltaPosition() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return dP_;
+  }
+
+  /** Update bias and related getters */
+  void SetNewBias(const Bias &bu) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    bu_ = bu;
+    db_ = bu_ - b_;
+  }
+
+  Bias GetUpdatedBias() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return bu_;
+  }
+
+  Bias GetDeltaBias() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return db_;
+  }
+
+  Eigen::Matrix3f GetUpdatedDeltaRotation() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return NormalizeRotation(dR_ * Sophus::SO3f::exp(JRg_ * db_.g).matrix());
+  }
+
+  Eigen::Vector3f GetUpdatedDeltaVelocity() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return dV_ + JVg_ * db_.g + JVa_ * db_.a;
+  }
+
+  Eigen::Vector3f GetUpdatedDeltaPosition() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return dP_ + JPg_ * db_.g + JPa_ * db_.a;
+  }
+
  private:
   std::vector<ImuMeasurement> measurements_;
   Bias b_;
+  Bias bu_;
+  Bias db_;
   Eigen::Matrix3f dR_;
   Eigen::Vector3f dV_, dP_;
   Eigen::Matrix3f JRg_, JVg_, JVa_, JPg_, JPa_;
   Eigen::Matrix<float, 9, 9> C_;
   Eigen::Matrix<float, 6, 6> Nga_;
   Eigen::Matrix<float, 6, 6> NgaWalk_;
+  std::mutex mutex_;
 };
